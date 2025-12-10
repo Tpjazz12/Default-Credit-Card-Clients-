@@ -1,0 +1,539 @@
+---
+title: "ASDS-6303 Final Project"
+author: "Phuong Trinh, Kyra Stolarski"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    keep_tex: true
+subtitle: Default of Credit Card Clients
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::knit_hooks$set(purl = knitr::hook_purl)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load Packages
+```{r}
+library(dplyr)
+library(ggplot2)
+library(caret)
+library(pROC)
+library(rpart)
+library(rpart.plot)
+library(corrplot)
+library(randomForest)
+```
+
+## Load Dataset and set seed for reproducibility
+```{r}
+set.seed(7)
+
+credit <- read.csv("C:/Users/stolarskikm/Downloads/default+of+credit+card+clients/default of credit card clients.csv",
+                   header = FALSE,
+                   stringsAsFactors = FALSE)
+
+head(credit)
+```
+
+## Data Cleaning and Preprocessing
+```{r}
+# Fix the header row
+# Set first row as column names
+colnames(credit) <- credit[2, ]
+
+# Remove the first 2 rows
+credit <- credit[-c(1,2), ]
+head(credit)
+```
+
+```{r}
+# Convert all character columns to numeric
+credit <- credit %>% mutate(across(where(is.character), readr::parse_number))
+
+# Sanity check
+str(credit)
+head(credit)
+```
+
+
+```{r}
+# Removing ID Column
+credit <- select(credit, -ID)
+
+# Cleaning column names
+names(credit) <- tolower(names(credit))
+names(credit)[names(credit) == 'default payment next month'] <- 'default_next_month'
+names(credit)[names(credit) == 'pay_0'] <- 'pay_1'
+head(credit)
+
+```
+
+
+```{r}
+# Re-coding categorical attributes and target
+
+# SEX: 1=Male, 2=Female
+credit <- credit %>%
+  mutate(sex = factor(sex, levels = c(1,2), labels = c("Male","Female")))
+
+# EDUCATION: fix odd codes to "Others"
+credit <- credit %>%
+  mutate(education = dplyr::recode(education,
+                                   `0`="Others", `1`="GradSchool", `2`="University",
+                                   `3`="HighSchool", `4`="Others", `5`="Others", `6`="Others"),
+         education = factor(education))
+
+# MARRIAGE: 1=Married, 2=Single, others -> "Others"
+credit <- credit %>%
+  mutate(marriage = dplyr::recode(marriage,
+                                  `0`="Others", `1`="Married", `2`="Single", `3`="Others"),
+         marriage = factor(marriage))
+
+# PAY_0..PAY_6 as ordered factors (payment status codes)
+pay_cols <- c("pay_1","pay_2","pay_3","pay_4","pay_5","pay_6")
+credit <- credit %>%
+  mutate(across(all_of(pay_cols), ~factor(., ordered = TRUE)))
+
+# Target Y to factor (0=No Default, 1=Default)
+credit <- credit %>%
+  mutate(default_next_month =
+           factor(default_next_month, levels = c(0,1),
+                  labels = c("NoDefault","Default"))) %>%
+  rename(y = default_next_month)
+
+
+str(credit[, c("sex","education","marriage",pay_cols,"y")])
+```
+
+```{r}
+# Missing values per column
+colSums(is.na(credit))
+```
+## Descriptive Statistics
+```{r}
+summary(credit)
+```
+The descriptive analysis shows several important patterns in the credit card default dataset. The average credit limit (LIMIT_BAL) is about 167,000, but the distribution is highly skewed, with some clients having extremely high limits. Most customers fall within the 30–41 age range, with a median age of 34. The majority of clients are female, university educated, and single or married, reflecting the demographic structure of the dataset.
+
+Payment history variables (PAY_0 to PAY_6) indicate that most customers are either on time or slightly delayed in previous months, though the presence of negative values (e.g., –1, –2) shows early payments or no usage. Bill amounts and payment amounts have strong right-skewness, with a few very large outliers across BILL_AMT and PAY_AMT variables. 
+
+Finally, the target variable shows that 23,335 clients (≈78%) are non-defaulters, while 6,630 clients (≈22%) defaulted, indicating moderate class imbalance. This imbalance is important to consider during modeling, especially for evaluation metrics and potential resampling techniques.
+
+## Exploratory Data Analysis 
+
+### Default Distribution 
+
+```{r}
+library(ggplot2)
+
+ggplot(credit, aes(x = y, fill = y)) +
+  geom_bar() +
+  scale_fill_manual(values = c("lightgreen", "lightpink")) +
+  labs(title = "Distribution of Default vs No Default",
+       x = "Default Status",
+       y = "Count") +
+  theme_minimal()
+```
+
+### Histogram of Credit Limit
+
+```{r}
+ggplot(credit, aes(x = limit_bal)) +
+  geom_histogram(bins = 30, fill = "skyblue", color = "white") +
+  labs(title = "Distribution of Credit Limit",
+       x = "Credit Limit (limit_bal)", 
+       y = "Frequency") +
+  theme_minimal()
+```
+
+### Credit Limit by Default Status 
+
+```{r}
+ggplot(credit, aes(x = y, y = limit_bal, fill = y)) +
+  geom_boxplot() +
+  scale_fill_manual(values = c("lightgreen", "lightpink")) +
+  labs(title = "Credit Limit by Default Status",
+       x = "Default Status",
+       y = "Credit Limit") +
+  theme_minimal()
+```
+
+
+### Histogram of age 
+
+```{r}
+ggplot(credit, aes(x = age)) +
+  geom_histogram(bins = 30, fill = "darkorange", color = "white") +
+  labs(title = "Age Distribution",
+       x = "Age",
+       y = "Frequency") +
+  theme_minimal()
+```
+
+### Age by Default 
+```{r}
+ggplot(credit, aes(x = y, y = age, fill = y)) +
+  geom_boxplot() +
+  scale_fill_manual(values = c("lightgreen", "lightpink"))+
+  labs(title = "Age by Default Status",
+       x = "Default Status",
+       y = "Age") +
+  theme_minimal()
+```
+
+### Correlation Heatmmap 
+```{r correlation_clean, message=FALSE, warning=FALSE, fig.width=8, fig.height=8}
+
+num_vars <- dplyr::select(credit, dplyr::where(is.numeric))
+corr_matrix <- stats::cor(num_vars, use = "pairwise.complete.obs")
+
+corrplot::corrplot(
+  corr_matrix,
+  method = "color",
+  type   = "lower",
+  addCoef.col = "black",
+  tl.col = "black",
+  diag   = FALSE
+)
+
+```
+
+```{r}
+# Find highly correlated variables & remove them
+threshold <- 0.70
+high_corr_vars <- caret::findCorrelation(
+  corr_matrix,
+  cutoff = threshold,
+  names  = TRUE
+)
+
+print(high_corr_vars)
+credit <- credit[, !(names(credit) %in% high_corr_vars)]
+```
+
+### Payment History vs Default 
+```{r}
+ggplot(credit, aes(x = pay_1, fill = y)) +
+  geom_bar(position = "dodge") +
+  labs(title = "PAY_1 Status vs Default",
+       x = "Repayment Status (PAY_1)",
+       y = "Count") +
+  scale_fill_manual(values = c("lightgreen", "lightpink")) +
+  theme_minimal()
+```
+
+PAY_0 = 0 or -1 → low default
+PAY_0 ≥ 1 → strong default risk
+
+This visually justifies why Decision Trees split on PAY_0 early
+
+### Payment Amount vs Bill Amount (Scatter)
+```{r}
+ggplot(credit, aes(x = bill_amt1, y = pay_amt1)) +
+  geom_point(alpha = 0.3, color = "red") +
+  labs(title = "Bill Amount vs Payment Amount (Month 1)",
+       x = "Bill Amount",
+       y = "Payment Amount") +
+  theme_minimal()
+```
+
+
+###Train-Test Split###
+```{r}
+# Train-Test Split
+train_index <- createDataPartition(credit$y, p = 0.7, list = FALSE)
+
+train_set <- credit[train_index, ]
+test_set  <- credit[-train_index, ]
+
+table(train_set$y)
+```
+
+```{r}
+# Oversampling Training Set
+train_set_bal <- upSample(x = train_set[, -which(names(train_set) == "y")],
+                     y = train_set$y,
+                     yname = "y")
+
+table(train_set_bal$y)
+```
+
+### Models
+```{r}
+# Function to plot confusion matrix
+plot_confusion_matrix <- function(cfm, title, color_low, color_high) {
+  cm_table <- as.data.frame(cfm$table)
+  ggplot(cm_table, aes(x = Reference, y = Prediction)) +
+    geom_tile(aes(fill = Freq), colour = "white") +
+    geom_text(aes(label = Freq), size = 5) +
+    scale_fill_gradient(low = color_low, high = color_high) +
+    scale_y_discrete(limits = rev(levels(cm_table$Reference))) +
+    ggtitle(title) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold", size = 14),
+      axis.title = element_text(size = 12),
+      axis.text = element_text(size = 11)
+    )
+}
+```
+
+## Logistic Regression - Imbalanced Training
+```{r}
+log_reg <- glm(y ~., family=binomial(link = 'logit'), data=train_set)
+summary(log_reg)
+```
+
+```{r}
+# Training performance
+log_pred_train <- predict(log_reg, newdata = train_set, type = "response")
+predicted_train <- factor(ifelse(log_pred_train > 0.5, 1, 0), levels = c(0,1), labels = c("NoDefault","Default"))
+
+con_mat <- confusionMatrix(predicted_train, train_set$y, mode = 'everything', positive = 'Default')
+print(con_mat)
+```
+
+```{r}
+# Test prediction
+log_pred_test <- predict(log_reg, newdata = test_set, type = "response")
+
+predicted_test <- factor(ifelse(log_pred_test > 0.5, 1, 0), levels = c(0,1), labels = c("NoDefault","Default"))
+
+con_mat <- confusionMatrix(predicted_test, test_set$y, mode = 'everything', positive = 'Default')
+print(con_mat)
+```
+
+```{r, echo = FALSE}
+plot_confusion_matrix(con_mat, 'Imbalanced Logistic Regression - Testing', 'aliceblue', 'steelblue')
+```
+```{r, echo = FALSE}
+# Calculate ROC curve
+roc_curve_test_log1 <- roc(test_set$y, log_pred_test)
+```
+## Logistic Regression - Balanced Training
+```{r}
+log_reg_bal <- glm(y ~., family=binomial(link = 'logit'), data=train_set_bal)
+summary(log_reg_bal)
+```
+
+```{r}
+# Balanced Training performance on original training set
+log_pred_train_bal <- predict(log_reg_bal, newdata = train_set, type = "response")
+predicted_train_bal <- factor(ifelse(log_pred_train_bal > 0.5, 1, 0), levels = c(0,1), labels = c("NoDefault","Default"))
+
+con_mat <- confusionMatrix(predicted_train_bal, train_set$y, mode = 'everything', positive = 'Default')
+print(con_mat)
+```
+
+
+```{r}
+# Balanced testing performance
+log_pred_test_bal <- predict(log_reg_bal, newdata = test_set, type = "response")
+predicted_test_bal <- factor(ifelse(log_pred_test_bal > 0.5, 1, 0), levels = c(0,1), labels = c("NoDefault","Default"))
+
+con_mat <- confusionMatrix(predicted_test_bal, test_set$y, mode = 'everything', positive = 'Default')
+print(con_mat)
+```
+```{r, echo = FALSE}
+plot_confusion_matrix(con_mat, 'Balanced Logistic Regression - Testing', 'aliceblue', 'steelblue')
+```
+
+```{r, echo = FALSE}
+# Calculate ROC curve
+roc_curve_test_log2 <- roc(test_set$y, log_pred_test_bal)
+```
+
+## CART Decision tree - Imbalanced Training Set
+```{r, echo = FALSE}
+dt_model <- rpart(y ~ ., 
+            data = train_set,
+            method = "class",
+            control = rpart.control(cp = 0.01))
+
+# Plot the tree
+rpart.plot(dt_model,
+           type = 2,
+           extra = 106,
+           fallen.leaves = TRUE,
+           main = "Imbalanced Decision Tree Model")
+```
+```{r}
+print(dt_model)
+```
+```{r, echo = FALSE}
+barplot(dt_model$variable.importance,
+        las = 2,
+        col = "darkgreen",
+        main = "Imbalanced Variable Importance",
+        ylim=c(0, max(dt_model$variable.importance) * 1.1))
+```
+```{r}
+# Training performance
+dt_pred_train <- predict(dt_model, train_set, type = "class")
+con_mat <- confusionMatrix(dt_pred_train, train_set$y, mode = 'everything', positive = "Default")
+print(con_mat)
+```
+```{r}
+# Testing performance
+dt_pred_test <- predict(dt_model, test_set, type = "class")
+con_mat <- confusionMatrix(dt_pred_test, test_set$y, mode = 'everything', positive = "Default")
+print(con_mat)
+```
+```{r, echo = FALSE}
+plot_confusion_matrix(con_mat, 'Imbalanced Decision Tree - Testing', '#E8FFE8', '#79B879')
+```
+```{r, echo = FALSE}
+# Calculate ROC curve
+prob_test <- predict(dt_model, test_set, type = "prob")[, "Default"]
+roc_curve_test_dt1 <- roc(test_set$y, prob_test)
+```
+## CART Decision tree - Balanced Training Set
+```{r, echo = FALSE}
+dt_model_bal <- rpart(y ~ ., 
+                  data = train_set_bal,
+                  method = "class",
+                  control = rpart.control(cp = 0.01))
+
+# Plot the tree
+rpart.plot(dt_model_bal,
+           type = 2,
+           extra = 106,
+           fallen.leaves = TRUE,
+           main = "Balanced Decision Tree Model")
+```
+
+```{r, echo = FALSE}
+barplot(dt_model_bal$variable.importance,
+        las = 2,
+        col = "darkgreen",
+        main = "Balanced Variable Importance",
+        ylim=c(0, max(dt_model_bal$variable.importance) * 1.1))
+```
+
+
+```{r}
+# Balanced Training performance on original training set
+dt_pred_train_bal <- predict(dt_model_bal, train_set, type = "class")
+con_mat <- confusionMatrix(dt_pred_train_bal, train_set$y, mode = 'everything', positive = "Default")
+print(con_mat)
+```
+
+```{r}
+# Testing performance
+dt_pred_test <- predict(dt_model_bal, test_set, type = "class")
+con_mat <- confusionMatrix(dt_pred_test, test_set$y, mode = 'everything', positive = "Default")
+print(con_mat)
+```
+
+```{r, echo = FALSE}
+plot_confusion_matrix(con_mat, 'Balanced Decision Tree - Testing', '#E8FFE8', '#79B879')
+```
+
+```{r, echo = FALSE}
+# Calculate ROC curve
+prob_test <- predict(dt_model_bal, test_set, type = "prob")[, "Default"]
+roc_curve_test_dt2 <- roc(test_set$y, prob_test)
+```
+
+## Random forest - Imbalanced Training Set
+```{r, echo = FALSE}
+library(randomForest)
+rf_model <- randomForest(y ~ ., data = train_set)
+print(rf_model)
+```
+
+```{r}
+oob_accuracy <- 1 - (rf_model$err.rate[nrow(rf_model$err.rate), "OOB"])
+  print(paste("OOB Training Accuracy:", oob_accuracy))
+```
+
+```{r, echo = FALSE}
+var_import <- importance(rf_model)
+varImpPlot(rf_model, main = 'Imbalanced Random Forest Variable Importance')
+```
+
+```{r}
+# Testing performance
+rf_pred_test <- predict(rf_model, test_set)
+con_mat <- confusionMatrix(rf_pred_test, test_set$y, mode = 'everything', positive = "Default")
+print(con_mat)
+```
+
+```{r, echo = FALSE}
+plot_confusion_matrix(con_mat, 'Imbalanced Random Forest - Testing', '#FFF3F2', '#BA615D')
+```
+
+```{r, echo = FALSE}
+# Calculate ROC curve
+prob_test <- predict(rf_model, test_set, type = "prob")[, "Default"]
+roc_curve_test_rf1 <- roc(test_set$y, prob_test)
+```
+
+## Random forest - Balanced Training Set
+```{r, echo = FALSE}
+rf_model_bal <- randomForest(y ~ ., data = train_set_bal)
+print(rf_model_bal)
+```
+
+```{r}
+oob_accuracy <- 1 - (rf_model_bal$err.rate[nrow(rf_model_bal$err.rate), "OOB"])
+  print(paste("OOB Training Accuracy:", oob_accuracy))
+```
+
+```{r, echo = FALSE}
+var_import <- importance(rf_model_bal)
+varImpPlot(rf_model, main = 'Balanced Random Forest Variable Importance')
+```
+
+```{r}
+# Balanced Training performance on original training set
+rf_pred_train_bal <- predict(rf_model_bal, train_set)
+con_mat <- confusionMatrix(rf_pred_train_bal, train_set$y, mode = 'everything', positive = "Default")
+print(con_mat)
+```
+
+
+```{r}
+# Testing performance
+rf_pred_test_bal <- predict(rf_model_bal, test_set)
+con_mat <- confusionMatrix(rf_pred_test_bal, test_set$y, mode = 'everything', positive = "Default")
+print(con_mat)
+```
+
+```{r, echo = FALSE}
+plot_confusion_matrix(con_mat, 'Balanced Random Forest - Testing', '#FFF3F2', '#BA615D')
+```
+
+```{r, echo = FALSE}
+# Calculate ROC curve
+prob_test <- predict(rf_model_bal, test_set, type = "prob")[, "Default"]
+roc_curve_test_rf2 <- roc(test_set$y, prob_test)
+```
+
+```{r, echo = FALSE}
+plot(roc_curve_test_log1, col = 'blue', main = "Comparison of ROC Curves - Imbalanced Data", print.auc = TRUE)
+plot(roc_curve_test_dt1, col = '#66D43F', add = TRUE, print.auc = TRUE, print.auc.y = .4)
+plot(roc_curve_test_rf1, col = 'red', add = TRUE, print.auc = TRUE, print.auc.y = .3)
+
+legend("bottomright", 
+       legend = c("Logistic Regression", "Decision Tree", "Random Forest"), 
+       col = c("blue", "#66D43F", "red"), 
+       lty = 1, 
+       cex = 0.8)
+```
+
+```{r, echo = FALSE}
+plot(roc_curve_test_log2, col = 'blue', main = "Comparison of ROC Curves - Balanced Data", print.auc = TRUE)
+plot(roc_curve_test_dt2, col = '#66D43F', add = TRUE, print.auc = TRUE, print.auc.y = .4)
+plot(roc_curve_test_rf2, col = 'red', add = TRUE, print.auc = TRUE, print.auc.y = .3)
+
+legend("bottomright", 
+       legend = c("Logistic Regression", "Decision Tree", "Random Forest"), 
+       col = c("blue", "#66D43F", "red"), 
+       lty = 1, 
+       cex = 0.8)
+
+```
